@@ -1,3 +1,4 @@
+import copy
 import os
 import fnmatch
 import json
@@ -21,7 +22,6 @@ class HDF5VLADataset:
         # [Modify] The path to the HDF5 dataset directory
         # Each HDF5 file contains one episode
         HDF5_DIR = "data/datasets/robomind/h5_agilex_3rgb"
-        DATASET_TYPE = "train"
         self.DATASET_NAME = "robomind"
         
         self.file_paths = []
@@ -29,10 +29,7 @@ class HDF5VLADataset:
             for filename in fnmatch.filter(files, '*.hdf5'):
                 file_path = os.path.join(root, filename)
                 self.file_paths.append(file_path)
-        
-        # filter the file paths by dataset type
-        self.file_paths = [path for path in self.file_paths if DATASET_TYPE in path]
-
+                
         # Load the config
         with open('configs/base.yaml', 'r') as file:
             config = yaml.safe_load(file)
@@ -119,10 +116,13 @@ class HDF5VLADataset:
                 } or None if the episode is invalid.
         """
         with h5py.File(file_path, 'r') as f:
-            qpos = f['observations']['qpos'][:]
+            qpos = np.concatenate([
+                f['puppet']['joint_position_left'][:],
+                f['puppet']['joint_position_right'][:]
+            ], axis=1)  # qpos = f['observations']['qpos'][:]
             num_steps = qpos.shape[0]
             # [Optional] We drop too-short episode
-            if num_steps < 128:
+            if num_steps < 128 or 'language_raw' not in f.keys():
                 return False, None
             
             # [Optional] We skip the first few still steps
@@ -137,21 +137,22 @@ class HDF5VLADataset:
             
             # We randomly sample a timestep
             step_id = np.random.randint(first_idx-1, num_steps)
-            
+
             # Load the instruction
-            dir_path = os.path.dirname(file_path)
-            with open(os.path.join(dir_path, 'expanded_instruction_gpt-4-turbo.json'), 'r') as f_instr:
-                instruction_dict = json.load(f_instr)
-            # We have 1/3 prob to use original instruction,
-            # 1/3 to use simplified instruction,
-            # and 1/3 to use expanded instruction.
-            instruction_type = np.random.choice([
-                'instruction', 'simplified_instruction', 'expanded_instruction'])
-            instruction = instruction_dict[instruction_type]
-            if isinstance(instruction, list):
-                instruction = np.random.choice(instruction)
-            # You can also use precomputed language embeddings (recommended)
-            # instruction = "path/to/lang_embed.pt"
+            instruction = f['language_raw'][0].decode('utf-8')
+            # dir_path = os.path.dirname(file_path)
+            # with open(os.path.join(dir_path, 'expanded_instruction_gpt-4-turbo.json'), 'r') as f_instr:
+            #     instruction_dict = json.load(f_instr)
+            # # We have 1/3 prob to use original instruction,
+            # # 1/3 to use simplified instruction,
+            # # and 1/3 to use expanded instruction.
+            # instruction_type = np.random.choice([
+            #     'instruction', 'simplified_instruction', 'expanded_instruction'])
+            # instruction = instruction_dict[instruction_type]
+            # if isinstance(instruction, list):
+            #     instruction = np.random.choice(instruction)
+            # # You can also use precomputed language embeddings (recommended)
+            # # instruction = "path/to/lang_embed.pt"
             
             # Assemble the meta
             meta = {
@@ -164,23 +165,21 @@ class HDF5VLADataset:
             # Rescale gripper to [0, 1]
             qpos = qpos / np.array(
                [[1, 1, 1, 1, 1, 1, 4.7908, 1, 1, 1, 1, 1, 1, 4.7888]] 
-            )
-            target_qpos = f['action'][step_id:step_id+self.CHUNK_SIZE] / np.array(
-               [[1, 1, 1, 1, 1, 1, 11.8997, 1, 1, 1, 1, 1, 1, 13.9231]] 
-            )
+            )   # 整个运动序列
             
             # Parse the state and action
-            state = qpos[step_id:step_id+1]
-            state_std = np.std(qpos, axis=0)
-            state_mean = np.mean(qpos, axis=0)
-            state_norm = np.sqrt(np.mean(qpos**2, axis=0))
-            actions = target_qpos
+            state = qpos[step_id:step_id+1] # 状态是当前帧
+            actions = copy.deepcopy(qpos)[step_id+1:step_id+1+self.CHUNK_SIZE]  # 动作是未来帧chuck
             if actions.shape[0] < self.CHUNK_SIZE:
                 # Pad the actions using the last action
                 actions = np.concatenate([
                     actions,
                     np.tile(actions[-1:], (self.CHUNK_SIZE-actions.shape[0], 1))
                 ], axis=0)
+
+            state_std = np.std(qpos, axis=0)
+            state_mean = np.mean(qpos, axis=0)
+            state_norm = np.sqrt(np.mean(qpos**2, axis=0))  # 统计值
             
             # Fill the state/action into the unified vector
             def fill_in_state(values):
@@ -211,8 +210,14 @@ class HDF5VLADataset:
             def parse_img(key):
                 imgs = []
                 for i in range(max(step_id-self.IMG_HISORY_SIZE+1, 0), step_id+1):
-                    img = f['observations']['images'][key][i]
-                    imgs.append(cv2.imdecode(np.frombuffer(img, np.uint8), cv2.IMREAD_COLOR))
+                    if key == 'cam_high':
+                        key = 'camera_front'
+                    elif key == 'cam_left_wrist':
+                        key = 'camera_left_wrist'
+                    elif key == 'cam_right_wrist':
+                        key = 'camera_right_wrist'
+                    img = f['observations']['rgb_images'][key][i]
+                    imgs.append(cv2.imdecode(img, cv2.IMREAD_COLOR))
                 imgs = np.stack(imgs)
                 if imgs.shape[0] < self.IMG_HISORY_SIZE:
                     # Pad the images using the first image
@@ -269,10 +274,13 @@ class HDF5VLADataset:
                 } or None if the episode is invalid.
         """
         with h5py.File(file_path, 'r') as f:
-            qpos = f['observations']['qpos'][:]
+            qpos = np.concatenate([
+                f['puppet']['joint_position_left'][:],
+                f['puppet']['joint_position_right'][:]
+            ], axis=1)  # qpos = f['observations']['qpos'][:]
             num_steps = qpos.shape[0]
             # [Optional] We drop too-short episode
-            if num_steps < 128:
+            if num_steps < 128 or 'language_raw' not in f.keys():
                 return False, None
             
             # [Optional] We skip the first few still steps
@@ -287,11 +295,12 @@ class HDF5VLADataset:
             
             # Rescale gripper to [0, 1]
             qpos = qpos / np.array(
-               [[1, 1, 1, 1, 1, 1, 4.7908, 1, 1, 1, 1, 1, 1, 4.7888]] 
+               [[1, 1, 1, 1, 1, 1, 4.7908, 1, 1, 1, 1, 1, 1, 4.7888]]   # TODO: why 4.7908 and 4.7888?
             )
-            target_qpos = f['action'][:] / np.array(
-               [[1, 1, 1, 1, 1, 1, 11.8997, 1, 1, 1, 1, 1, 1, 13.9231]] 
-            )
+            target_qpos = copy.deepcopy(qpos)
+            # target_qpos = f['action'][:] / np.array(
+            #    [[1, 1, 1, 1, 1, 1, 11.8997, 1, 1, 1, 1, 1, 1, 13.9231]]     # TODO: why 11.8997 and 13.9231?
+            # )
             
             # Parse the state and action
             state = qpos[first_idx-1:]
@@ -326,4 +335,7 @@ if __name__ == "__main__":
     ds = HDF5VLADataset()
     for i in range(len(ds)):
         print(f"Processing episode {i}/{len(ds)}...")
-        ds.get_item(i)
+        sample = ds.get_item()
+        print(sample.keys())
+        print(sample['cam_high'].shape)
+        print(sample['actions'].shape)
